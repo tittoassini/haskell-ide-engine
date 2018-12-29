@@ -82,9 +82,10 @@ getDynFlags = ms_hspp_opts . pm_mod_summary . tm_parsed_module
 
 -- ---------------------------------------------------------------------
 
-data NameMapData = NMD
-  { inverseNameMap ::  !(Map.Map Name [SrcSpan])
+newtype NameMapData = NMD
+  { inverseNameMap ::  Map.Map Name [SrcSpan]
   } deriving (Typeable)
+
 
 invert :: (Ord v) => Map.Map k v -> Map.Map v [k]
 invert m = Map.fromListWith (++) [(v,[k]) | (k,v) <- Map.toList m]
@@ -135,7 +136,7 @@ mkCompl CI{origName,importedFrom,thingType,label} =
           | otherwise = label <> " " <> argText
         argText :: T.Text
         argText =  mconcat $ List.intersperse " " $ zipWith snippet [1..] argTypes
-        stripForall t 
+        stripForall t
           | T.isPrefixOf "forall" t =
             -- We drop 2 to remove the '.' and the space after it
             T.drop 2 (T.dropWhile (/= '.') t)
@@ -225,8 +226,7 @@ instance ModuleCache CachedCompletions where
         showModName = T.pack . moduleNameString
 
         asNamespace :: ImportDecl name -> ModuleName
-        asNamespace imp = fromMaybe (iDeclToModName imp) (fmap GHC.unLoc $ ideclAs imp)
-
+        asNamespace imp = maybe (iDeclToModName imp) GHC.unLoc (ideclAs imp)
         -- Full canonical names of imported modules
         importDeclerations = map unLoc limports
 
@@ -274,7 +274,7 @@ instance ModuleCache CachedCompletions where
 
         orgUnqualQual hscEnv (prevUnquals, prevQualKVs) (isQual, modQual, modName, hasHiddsMembers) =
           let
-            ifUnqual xs = if isQual then prevUnquals else (prevUnquals ++ xs)
+            ifUnqual xs = if isQual then prevUnquals else prevUnquals ++ xs
             setTypes = setComplsType hscEnv
           in
             case hasHiddsMembers of
@@ -340,16 +340,15 @@ newtype WithSnippets = WithSnippets Bool
 getCompletions :: Uri -> PosPrefixInfo -> WithSnippets -> IdeM (IdeResult [J.CompletionItem])
 getCompletions uri prefixInfo (WithSnippets withSnippets) =
   pluginGetFile "getCompletions: " uri $ \file -> do
-    supportsSnippets <- fromMaybe False <$> asks
-      (^? J.textDocument
-        . _Just
-        . J.completion
-        . _Just
-        . J.completionItem
-        . _Just
-        . J.snippetSupport
-        . _Just
-      )
+    let snippetLens = (^? J.textDocument
+                        . _Just
+                        . J.completion
+                        . _Just
+                        . J.completionItem
+                        . _Just
+                        . J.snippetSupport
+                        . _Just)
+    supportsSnippets <- fromMaybe False . snippetLens <$> getClientCapabilities
     let toggleSnippets x
           | withSnippets && supportsSnippets = x
           | otherwise = x { J._insertTextFormat = Just J.PlainText
@@ -360,7 +359,7 @@ getCompletions uri prefixInfo (WithSnippets withSnippets) =
     debugm $ "got prefix" ++ show (prefixModule, prefixText)
     let enteredQual = if T.null prefixModule then "" else prefixModule <> "."
         fullPrefix  = enteredQual <> prefixText
-      
+
     ifCachedModuleAndData file (IdeResultOk [])
       $ \tm CachedInfo { newPosToOld } CC { allModNamesAsNS, unqualCompls, qualCompls, importableModules, cachedExtensions } ->
           let
@@ -423,13 +422,19 @@ getCompletions uri prefixInfo (WithSnippets withSnippets) =
             filtPragmaCompls = filtListWithSnippet mkPragmaCompl validPragmas
             filtOptsCompls   = filtListWith mkExtCompl
 
+            stripLeading :: Char -> String -> String
+            stripLeading _ [] = []
+            stripLeading c (s:ss)
+              | s == c = ss
+              | otherwise = s:ss
+
             result
               | "import " `T.isPrefixOf` fullLine
               = filtImportCompls
               | "{-# language" `T.isPrefixOf` T.toLower fullLine
               = filtOptsCompls cachedExtensions
               | "{-# options_ghc" `T.isPrefixOf` T.toLower fullLine
-              = filtOptsCompls (map T.pack $ GHC.flagsForCompletion False)
+              = filtOptsCompls (map (T.pack . stripLeading '-') $ GHC.flagsForCompletion False)
               | "{-# " `T.isPrefixOf` fullLine
               = filtPragmaCompls (pragmaSuffix fullLine)
               | otherwise
@@ -526,7 +531,7 @@ showName :: Outputable a => a -> T.Text
 showName = T.pack . prettyprint
   where
     prettyprint x = GHC.renderWithStyle GHC.unsafeGlobalDynFlags (GHC.ppr x) style
-    style = (GHC.mkUserStyle GHC.unsafeGlobalDynFlags GHC.neverQualify GHC.AllTheWay)
+    style = GHC.mkUserStyle GHC.unsafeGlobalDynFlags GHC.neverQualify GHC.AllTheWay
 
 getModule :: DynFlags -> Name -> Maybe (Maybe T.Text,T.Text)
 getModule df n = do
@@ -595,10 +600,9 @@ findDef uri pos = pluginGetFile "findDef: " uri $ \file ->
 
 -- ---------------------------------------------------------------------
 
-getRangeFromVFS :: (MonadIO m)
-  => Uri -> VirtualFileFunc -> Range -> m (Maybe T.Text)
-getRangeFromVFS uri vf rg = do
-  mvf <- liftIO $ vf uri
+getRangeFromVFS :: Uri -> Range -> IdeM (Maybe T.Text)
+getRangeFromVFS uri rg = do
+  mvf <- getVirtualFile uri
   case mvf of
     Just vfs -> return $ Just $ rangeLinesFromVfs vfs rg
     Nothing  -> return Nothing
@@ -639,7 +643,7 @@ runGhcModCommand cmd =
 -- ---------------------------------------------------------------------
 
 splitCaseCmd :: CommandFunc HarePoint WorkspaceEdit
-splitCaseCmd = CmdSync $ \_ (HP uri pos) -> splitCaseCmd' uri pos
+splitCaseCmd = CmdSync $ \(HP uri pos) -> splitCaseCmd' uri pos
 
 splitCaseCmd' :: Uri -> Position -> IdeGhcM (IdeResult WorkspaceEdit)
 splitCaseCmd' uri newPos =
@@ -696,16 +700,64 @@ splitCaseCmd' uri newPos =
 
 -- ---------------------------------------------------------------------
 
-{- Under certain circumstance GHC generates some extra stuff that we don't want in the autocompleted symbols -}
+-- | Under certain circumstance GHC generates some extra stuff that we
+-- don't want in the autocompleted symbols
 stripAutoGenerated :: CompItem -> CompItem
 stripAutoGenerated ci =
-    ci {label = stripRecordSelector (label ci)}
-  where
-    {- When DuplicateRecordFields is enabled, compiler generates
+    ci {label = stripPrefix (label ci)}
+    {- When e.g. DuplicateRecordFields is enabled, compiler generates
     names like "$sel:accessor:One" and "$sel:accessor:Two" to disambiguate record selectors
     https://ghc.haskell.org/trac/ghc/wiki/Records/OverloadedRecordFields/DuplicateRecordFields#Implementation
     -}
-    stripRecordSelector :: T.Text -> T.Text
-    stripRecordSelector name
-      | T.isPrefixOf "$sel:" name = T.takeWhile (/=':') $ T.drop 5 name          
-      | otherwise = name
+
+-- TODO: Turn this into an alex lexer that discards prefixes as if they were whitespace.
+
+stripPrefix :: T.Text -> T.Text
+stripPrefix name = T.takeWhile (/=':') $ go prefixes
+  where
+    go [] = name
+    go (p:ps)
+      | T.isPrefixOf p name = T.drop (T.length p) name
+      | otherwise = go ps
+
+-- | Prefixes that can occur in a GHC OccName
+prefixes :: [T.Text]
+prefixes =
+  [
+    -- long ones
+    "$con2tag_"
+  , "$tag2con_"
+  , "$maxtag_"
+
+  -- four chars
+  , "$sel:"
+  , "$tc'"
+
+  -- three chars
+  , "$dm"
+  , "$co"
+  , "$tc"
+  , "$cp"
+  , "$fx"
+
+  -- two chars
+  , "$W"
+  , "$w"
+  , "$m"
+  , "$b"
+  , "$c"
+  , "$d"
+  , "$i"
+  , "$s"
+  , "$f"
+  , "$r"
+  , "C:"
+  , "N:"
+  , "D:"
+  , "$p"
+  , "$L"
+  , "$f"
+  , "$t"
+  , "$c"
+  , "$m"
+  ]

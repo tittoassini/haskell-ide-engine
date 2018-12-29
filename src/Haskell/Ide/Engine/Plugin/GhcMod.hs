@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP                 #-}
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE OverloadedStrings   #-}
@@ -76,8 +77,7 @@ type Diagnostics = Map.Map Uri (Set.Set Diagnostic)
 type AdditionalErrs = [T.Text]
 
 checkCmd :: CommandFunc Uri (Diagnostics, AdditionalErrs)
-checkCmd = CmdSync $ \_ uri ->
-  setTypecheckedModule uri
+checkCmd = CmdSync setTypecheckedModule
 
 -- ---------------------------------------------------------------------
 
@@ -193,11 +193,12 @@ setTypecheckedModule uri =
 
     canonUri <- canonicalizeUri uri
     let diags = Map.insertWith Set.union canonUri Set.empty diags'
-    case (mpm,mtm) of
+    diags2 <- case (mpm,mtm) of
       (Just pm, Nothing) -> do
         debugm $ "setTypecheckedModule: Did get parsed module for: " ++ show fp
         cacheModule fp (Left pm)
         debugm "setTypecheckedModule: done"
+        return diags
 
       (_, Just tm) -> do
         debugm $ "setTypecheckedModule: Did get typechecked module for: " ++ show fp
@@ -208,19 +209,26 @@ setTypecheckedModule uri =
         modifyMTS (\s -> s {ghcSession = sess})
         cacheModule fp (Right tm)
         debugm "setTypecheckedModule: done"
+        return diags
 
       _ -> do
         debugm $ "setTypecheckedModule: Didn't get typechecked or parsed module for: " ++ show fp
+        debugm $ "setTypecheckedModule: errs: " ++ show errs
 
         failModule fp
 
-    return $ IdeResultOk (diags,errs)
+        let sev = Just DsError
+            range = Range (Position 0 0) (Position 1 0)
+            msgTxt = T.unlines errs
+        let d = Diagnostic range sev Nothing (Just "ghcmod") msgTxt Nothing
+        return $ Map.insertWith Set.union canonUri (Set.singleton d) diags
+
+    return $ IdeResultOk (diags2,errs)
 
 -- ---------------------------------------------------------------------
 
 lintCmd :: CommandFunc Uri T.Text
-lintCmd = CmdSync $ \_ uri ->
-  lintCmd' uri
+lintCmd = CmdSync lintCmd'
 
 lintCmd' :: Uri -> IdeGhcM (IdeResult T.Text)
 lintCmd' uri =
@@ -243,7 +251,7 @@ instance ToJSON InfoParams where
   toJSON = genericToJSON customOptions
 
 infoCmd :: CommandFunc InfoParams T.Text
-infoCmd = CmdSync $ \_ (IP uri expr) ->
+infoCmd = CmdSync $ \(IP uri expr) ->
   infoCmd' uri expr
 
 infoCmd' :: Uri -> T.Text -> IdeGhcM (IdeResult T.Text)
@@ -264,7 +272,7 @@ instance ToJSON TypeParams where
   toJSON = genericToJSON customOptions
 
 typeCmd :: CommandFunc TypeParams [(Range,T.Text)]
-typeCmd = CmdSync $ \_ (TP _bool uri pos) ->
+typeCmd = CmdSync $ \(TP _bool uri pos) ->
   liftToGhc $ newTypeCmd pos uri
 
 newTypeCmd :: Position -> Uri -> IdeM (IdeResult [(Range, T.Text)])
@@ -322,12 +330,12 @@ data TypedHoles =
              } deriving (Eq, Show)
 
 codeActionProvider :: CodeActionProvider
-codeActionProvider pid docId vf mfp r ctx = do
+codeActionProvider pid docId r ctx = do
   support <- clientSupportsDocumentChanges
-  codeActionProvider' support pid docId vf mfp r ctx
+  codeActionProvider' support pid docId r ctx
 
 codeActionProvider' :: Bool -> CodeActionProvider
-codeActionProvider' supportsDocChanges _ docId _ _ _ context =
+codeActionProvider' supportsDocChanges _ docId _ context =
   let LSP.List diags = context ^. LSP.diagnostics
       terms = concatMap getRenamables diags
       renameActions = map (uncurry mkRenamableAction) terms
@@ -609,38 +617,102 @@ symbolProvider uri = pluginGetFile "ghc-mod symbolProvider: " uri $
         decls = concatMap go $ hsmodDecls hsMod
 
         go :: LHsDecl GM.GhcPs -> [Decl]
-        go (L l (TyClD FamDecl { tcdFam = FamilyDecl { fdLName = n } })) = pure (Decl LSP.SkClass n [] l)
-        go (L l (TyClD SynDecl { tcdLName = n })) = pure (Decl LSP.SkClass n [] l)
-        go (L l (TyClD DataDecl { tcdLName = n, tcdDataDefn = HsDataDefn { dd_cons = cons } })) =
+#if __GLASGOW_HASKELL__ >= 806
+        go (L l (TyClD _ d)) = goTyClD (L l d)
+#else
+        go (L l (TyClD   d)) = goTyClD (L l d)
+#endif
+
+#if __GLASGOW_HASKELL__ >= 806
+        go (L l (ValD _ d)) = goValD (L l d)
+#else
+        go (L l (ValD   d)) = goValD (L l d)
+#endif
+#if __GLASGOW_HASKELL__ >= 806
+        go (L l (ForD _ ForeignImport { fd_name = n })) = pure (Decl LSP.SkFunction n [] l)
+#else
+        go (L l (ForD   ForeignImport { fd_name = n })) = pure (Decl LSP.SkFunction n [] l)
+#endif
+        go _ = []
+
+        -- -----------------------------
+
+        goTyClD (L l (FamDecl { tcdFam = FamilyDecl { fdLName = n } })) = pure (Decl LSP.SkClass n [] l)
+        goTyClD (L l (SynDecl { tcdLName = n })) = pure (Decl LSP.SkClass n [] l)
+        goTyClD (L l (DataDecl { tcdLName = n, tcdDataDefn = HsDataDefn { dd_cons = cons } })) =
           pure (Decl LSP.SkClass n (concatMap processCon cons) l)
-        go (L l (TyClD ClassDecl { tcdLName = n, tcdSigs = sigs, tcdATs = fams })) =
+        goTyClD (L l (ClassDecl { tcdLName = n, tcdSigs = sigs, tcdATs = fams })) =
           pure (Decl LSP.SkInterface n children l)
           where children = famDecls ++ sigDecls
+#if __GLASGOW_HASKELL__ >= 806
+                famDecls = concatMap (go . fmap (TyClD NoExt . FamDecl NoExt)) fams
+#else
                 famDecls = concatMap (go . fmap (TyClD . FamDecl)) fams
+#endif
                 sigDecls = concatMap processSig sigs
+#if __GLASGOW_HASKELL__ >= 806
+        goTyClD (L _ (FamDecl _ (XFamilyDecl _)))        = error "goTyClD"
+        goTyClD (L _ (DataDecl _ _ _ _ (XHsDataDefn _))) = error "goTyClD"
+        goTyClD (L _ (XTyClDecl _))                      = error "goTyClD"
+#endif
 
-        go (L l (ValD FunBind { fun_id = ln, fun_matches = MG { mg_alts = llms } })) =
+        -- -----------------------------
+
+        goValD :: LHsBind GM.GhcPs -> [Decl]
+        goValD (L l (FunBind { fun_id = ln, fun_matches = MG { mg_alts = llms } })) =
           pure (Decl LSP.SkFunction ln wheres l)
           where
             wheres = concatMap (gomatch . unLoc) (unLoc llms)
             gomatch Match { m_grhss = GRHSs { grhssLocalBinds = lbs } } = golbs (unLoc lbs)
+#if __GLASGOW_HASKELL__ >= 806
+            gomatch (Match _ _ _ (XGRHSs _)) = error "gomatch"
+            gomatch (XMatch _)               = error "gomatch"
+
+            golbs (HsValBinds _ (ValBinds _ lhsbs _)) = concatMap (go . fmap (ValD NoExt)) lhsbs
+#else
             golbs (HsValBinds (ValBindsIn lhsbs _ )) = concatMap (go . fmap ValD) lhsbs
+#endif
             golbs _ = []
 
-        go (L l (ValD PatBind { pat_lhs = p })) =
+        goValD (L l (PatBind { pat_lhs = p })) =
           map (\n -> Decl LSP.SkVariable n [] l) $ hsNamessRdr p
-        go (L l (ForD ForeignImport { fd_name = n })) = pure (Decl LSP.SkFunction n [] l)
-        go _ = []
+
+#if __GLASGOW_HASKELL__ >= 806
+        goValD (L _ (FunBind _ _ (XMatchGroup _) _ _)) = error "goValD"
+        goValD (L _ (VarBind _ _ _ _))                 = error "goValD"
+        goValD (L _ (AbsBinds _ _ _ _ _ _ _))          = error "goValD"
+        goValD (L _ (PatSynBind _ _))                  = error "goValD"
+        goValD (L _ (XHsBindsLR _))                    = error "goValD"
+#elif __GLASGOW_HASKELL__ >= 804
+        goValD (L _ (VarBind _ _ _))        = error "goValD"
+        goValD (L _ (AbsBinds _ _ _ _ _ _)) = error "goValD"
+        goValD (L _ (PatSynBind _))         = error "goValD"
+#else
+        goValD (L _ (VarBind _ _ _))           = error "goValD"
+        goValD (L _ (AbsBinds _ _ _ _ _))      = error "goValD"
+        goValD (L _ (AbsBindsSig _ _ _ _ _ _)) = error "goValD"
+        goValD (L _ (PatSynBind _))            = error "goValD"
+#endif
+
+        -- -----------------------------
 
         processSig :: LSig GM.GhcPs -> [Decl]
+#if __GLASGOW_HASKELL__ >= 806
+        processSig (L l (ClassOpSig _ False names _)) =
+#else
         processSig (L l (ClassOpSig False names _)) =
+#endif
           map (\n -> Decl LSP.SkMethod n [] l) names
         processSig _ = []
 
         processCon :: LConDecl GM.GhcPs -> [Decl]
         processCon (L l ConDeclGADT { con_names = names }) =
           map (\n -> Decl LSP.SkConstructor n [] l) names
+#if __GLASGOW_HASKELL__ >= 806
+        processCon (L l ConDeclH98 { con_name = name, con_args    = dets }) =
+#else
         processCon (L l ConDeclH98 { con_name = name, con_details = dets }) =
+#endif
           pure (Decl LSP.SkConstructor name xs l)
           where
             f (L fl ln) = Decl LSP.SkField ln [] fl
@@ -649,6 +721,9 @@ symbolProvider uri = pluginGetFile "ghc-mod symbolProvider: " uri $
                                             . cd_fld_names
                                             . unLoc) rs
               _ -> []
+#if __GLASGOW_HASKELL__ >= 806
+        processCon (L _ (XConDecl _)) = error "processCon"
+#endif
 
         goImport :: LImportDecl GM.GhcPs -> [Decl]
         goImport (L l ImportDecl { ideclName = lmn, ideclAs = as, ideclHiding = meis }) = pure im
@@ -660,15 +735,25 @@ symbolProvider uri = pluginGetFile "ghc-mod symbolProvider: " uri $
             xs = case meis of
                     Just (False, eis) -> concatMap f (unLoc eis)
                     _ -> []
-            f (L l' (IEVar n)) = pure (Decl LSP.SkFunction (ieLWrappedName n) [] l')
+#if __GLASGOW_HASKELL__ >= 806
+            f (L l' (IEVar _ n))      = pure (Decl LSP.SkFunction (ieLWrappedName n) [] l')
+            f (L l' (IEThingAbs _ n)) = pure (Decl LSP.SkClass (ieLWrappedName n) [] l')
+            f (L l' (IEThingAll _ n)) = pure (Decl LSP.SkClass (ieLWrappedName n) [] l')
+            f (L l' (IEThingWith _ n _ vars fields)) =
+#else
+            f (L l' (IEVar n))      = pure (Decl LSP.SkFunction (ieLWrappedName n) [] l')
             f (L l' (IEThingAbs n)) = pure (Decl LSP.SkClass (ieLWrappedName n) [] l')
             f (L l' (IEThingAll n)) = pure (Decl LSP.SkClass (ieLWrappedName n) [] l')
             f (L l' (IEThingWith n _ vars fields)) =
-              let funcDecls = map (\n' -> Decl LSP.SkFunction (ieLWrappedName n') [] (getLoc n')) vars
+#endif
+              let funcDecls  = map (\n' -> Decl LSP.SkFunction (ieLWrappedName n') [] (getLoc n')) vars
                   fieldDecls = map (\f' -> Decl LSP.SkField (flSelector <$> f') [] (getLoc f')) fields
                   children = funcDecls ++ fieldDecls
                 in pure (Decl LSP.SkClass (ieLWrappedName n) children l')
             f _ = []
+#if __GLASGOW_HASKELL__ >= 806
+        goImport (L _ (XImportDecl _)) = error "goImport"
+#endif
 
         declsToSymbolInf :: Decl -> IdeDeferM [LSP.DocumentSymbol]
         declsToSymbolInf (Decl kind (L nl rdrName) children l) =

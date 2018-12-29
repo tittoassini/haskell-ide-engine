@@ -38,9 +38,9 @@ data AddPragmaParams = AddPragmaParams
   deriving (Show, Eq, Generics.Generic, ToJSON, FromJSON)
 
 addPragmaCmd :: CommandFunc AddPragmaParams J.WorkspaceEdit
-addPragmaCmd = CmdSync $ \_vf (AddPragmaParams uri pragmaName) -> do
+addPragmaCmd = CmdSync $ \(AddPragmaParams uri pragmaName) -> do
   let
-    pos = (J.Position 0 0)
+    pos = J.Position 0 0
     textEdits = J.List
       [J.TextEdit (J.Range pos pos)
                   ("{-# LANGUAGE " <> pragmaName <> " #-}\n")
@@ -53,7 +53,7 @@ addPragmaCmd = CmdSync $ \_vf (AddPragmaParams uri pragmaName) -> do
 -- ---------------------------------------------------------------------
 
 codeActionProvider :: CodeActionProvider
-codeActionProvider plId docId _ _ _ (J.CodeActionContext (J.List diags) _monly) = do
+codeActionProvider plId docId _ (J.CodeActionContext (J.List diags) _monly) = do
   cmds <- mapM mkCommand pragmas
   return $ IdeResultOk cmds
   where
@@ -73,10 +73,7 @@ codeActionProvider plId docId _ _ _ (J.CodeActionContext (J.List diags) _monly) 
 findPragma :: T.Text -> [T.Text]
 findPragma str = concatMap check possiblePragmas
   where
-    check p =
-      if T.isInfixOf p str
-        then [p]
-        else []
+    check p = [p | T.isInfixOf p str]
 
 -- ---------------------------------------------------------------------
 

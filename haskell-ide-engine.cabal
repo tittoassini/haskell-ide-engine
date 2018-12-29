@@ -1,5 +1,5 @@
 name:                haskell-ide-engine
-version:             0.2.2.0
+version:             0.4.0.1
 synopsis:            Provide a common engine to power any Haskell IDE
 description:         Please see README.md
 homepage:            http://github.com/githubuser/haskell-ide-engine#readme
@@ -23,7 +23,6 @@ library
                        Haskell.Ide.Engine.Channel
                        Haskell.Ide.Engine.Scheduler
                        Haskell.Ide.Engine.LSP.CodeActions
-                       Haskell.Ide.Engine.LSP.Config
                        Haskell.Ide.Engine.LSP.Reactor
                        Haskell.Ide.Engine.Options
                        Haskell.Ide.Engine.Plugin.ApplyRefact
@@ -56,7 +55,7 @@ library
                      , brittany
                      , bytestring
                      , Cabal
-                     , cabal-helper >= 0.8.1.0
+                     , cabal-helper >= 0.8.0.4
                      , containers
                      , data-default
                      , directory
@@ -172,6 +171,7 @@ test-suite unit-test
                      , hoogle > 5.0.11
                      , hspec
                      , quickcheck-instances
+                     , stm
                      , text
                      , unordered-containers
 
@@ -289,6 +289,7 @@ test-suite func-test
                      , DefinitionSpec
                      , DiagnosticsSpec
                      , FormatSpec
+                     , FunctionalBadProjectSpec
                      , FunctionalCodeActionsSpec
                      , FunctionalLiquidSpec
                      , FunctionalSpec
@@ -309,7 +310,7 @@ test-suite func-test
                      , data-default
                      , directory
                      , filepath
-                     , lsp-test == 0.4.*
+                     , lsp-test == 0.5.*
                      , haskell-ide-engine
                      -- , hie-test-utils
                      , hie-plugin-api

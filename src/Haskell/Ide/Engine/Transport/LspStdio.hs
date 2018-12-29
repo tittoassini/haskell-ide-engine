@@ -4,7 +4,7 @@
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE LambdaCase            #-}
-{-# LANGUAGE NamedFieldPuns            #-}
+{-# LANGUAGE NamedFieldPuns        #-}
 {-# LANGUAGE MultiWayIf            #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
@@ -42,14 +42,13 @@ import qualified Data.Text as T
 import           Data.Text.Encoding
 import qualified GhcModCore               as GM
 import qualified GhcMod.Monad.Types       as GM
-import           Haskell.Ide.Engine.PluginDescriptor
+import           Haskell.Ide.Engine.Config
 import           Haskell.Ide.Engine.MonadFunctions
 import           Haskell.Ide.Engine.MonadTypes
 import           Haskell.Ide.Engine.PluginUtils
 import qualified Haskell.Ide.Engine.Scheduler            as Scheduler
 import           Haskell.Ide.Engine.Types
 import           Haskell.Ide.Engine.LSP.CodeActions
-import           Haskell.Ide.Engine.LSP.Config
 import           Haskell.Ide.Engine.LSP.Reactor
 import qualified Haskell.Ide.Engine.Plugin.HaRe          as HaRe
 import qualified Haskell.Ide.Engine.Plugin.GhcMod        as GhcMod
@@ -74,7 +73,7 @@ import qualified Yi.Rope as Yi
 -- ---------------------------------------------------------------------
 {-# ANN module ("hlint: ignore Eta reduce" :: String) #-}
 {-# ANN module ("hlint: ignore Redundant do" :: String) #-}
-
+{-# ANN module ("hlint: ignore Use tuple-section" :: String) #-}
 -- ---------------------------------------------------------------------
 
 lspStdioTransport
@@ -126,8 +125,7 @@ run scheduler _origDir plugins captureFp = flip E.catches handlers $ do
   let dp lf = do
         diagIn      <- atomically newTChan
         let react = runReactor lf scheduler diagnosticProviders hps sps
-        let reactorFunc = react $ reactor rin diagIn
-            caps = Core.clientCapabilities lf
+            reactorFunc = react $ reactor rin diagIn
 
         let errorHandler :: Scheduler.ErrorHandler
             errorHandler lid code e =
@@ -144,15 +142,17 @@ run scheduler _origDir plugins captureFp = flip E.catches handlers $ do
         let diagnosticsQueue tr = forever $ do
               inval <- liftIO $ atomically $ readTChan diagIn
               Debounce.send tr (coerce . Just $ MostRecent inval)
-
-        tr <- Debounce.new -- Debounce for 350ms
+        
+        -- Debounce for (default) 350ms.
+        debounceDuration <- diagnosticsDebounceDuration . fromMaybe def <$> Core.config lf
+        tr <- Debounce.new
           (Debounce.forMonoid $ react . dispatchDiagnostics)
-          (Debounce.def { Debounce.delay = 350000, Debounce.alwaysResetTimer = True })
+          (Debounce.def { Debounce.delay = debounceDuration, Debounce.alwaysResetTimer = True })
 
         -- haskell lsp sets the current directory to the project root in the InitializeRequest
         -- We launch the dispatcher after that so that the default cradle is
         -- recognized properly by ghc-mod
-        _ <- forkIO $ Scheduler.runScheduler scheduler errorHandler callbackHandler caps
+        _ <- forkIO $ Scheduler.runScheduler scheduler errorHandler callbackHandler (Just lf)
                     `race_` reactorFunc
                     `race_` diagnosticsQueue tr
         return Nothing
@@ -214,7 +214,7 @@ getPrefixAtPos uri pos@(Position l c) = do
         curLine <- headMaybe $ Yi.lines $ snd $ Yi.splitAtLine l yitext
         let beforePos = Yi.take c curLine
         curWord <- case Yi.last beforePos of
-                     Just ' ' -> Just "" -- don't count abc as the curword in 'abc ' 
+                     Just ' ' -> Just "" -- don't count abc as the curword in 'abc '
                      _ -> Yi.toText <$> lastMaybe (Yi.words beforePos)
         let parts = T.split (=='.')
                       $ T.takeWhileEnd (\x -> isAlphaNum x || x `elem` ("._'"::String)) curWord
@@ -288,7 +288,7 @@ updatePositionMap uri changes = pluginGetFile "updatePositionMap: " uri $ \file 
           0123456789
           xxIIIIiixx
            ^
-          
+
           pos is unchanged if before the edited range
       -}
       | l == sl && c <= sc = Just p
@@ -296,7 +296,7 @@ updatePositionMap uri changes = pluginGetFile "updatePositionMap: " uri $ \file 
       {-
           01234  56
           xxxxx  xx
-            ^    
+            ^
           012345678
           xxIIIiixx
                  ^
@@ -334,7 +334,7 @@ publishDiagnostics :: (MonadIO m, MonadReader REnv m)
   => Int -> J.Uri -> J.TextDocumentVersion -> DiagnosticsBySource -> m ()
 publishDiagnostics maxToSend uri' mv diags = do
   lf <- asks lspFuncs
-  liftIO $ (Core.publishDiagnosticsFunc lf) maxToSend uri' mv diags
+  liftIO $ Core.publishDiagnosticsFunc lf maxToSend uri' mv diags
 
 -- ---------------------------------------------------------------------
 
@@ -342,7 +342,7 @@ flushDiagnosticsBySource :: (MonadIO m, MonadReader REnv m)
   => Int -> Maybe J.DiagnosticSource -> m ()
 flushDiagnosticsBySource maxToSend msource = do
   lf <- asks lspFuncs
-  liftIO $ (Core.flushDiagnosticsBySourceFunc lf) maxToSend msource
+  liftIO $ Core.flushDiagnosticsBySourceFunc lf maxToSend msource
 
 -- ---------------------------------------------------------------------
 
@@ -477,6 +477,8 @@ reactor inp diagIn = do
         NotWillSaveTextDocument _notification -> do
           liftIO $ U.logm "****** reactor: not processing NotWillSaveTextDocument"
 
+        -- -------------------------------
+
         NotDidSaveTextDocument notification -> do
           -- This notification is redundant, as we get the NotDidChangeTextDocument
           liftIO $ U.logm "****** reactor: processing NotDidSaveTextDocument"
@@ -486,7 +488,10 @@ reactor inp diagIn = do
               -- ver = Just $ td ^. J.version
               ver = Nothing
           mapFileFromVfs tn $ J.VersionedTextDocumentIdentifier uri ver
-          queueDiagnosticsRequest diagIn DiagnosticOnSave tn uri ver
+          -- don't debounce/queue diagnostics when saving
+          requestDiagnostics (DiagnosticsRequest DiagnosticOnSave tn uri ver)
+
+        -- -------------------------------
 
         NotDidChangeTextDocument notification -> do
           liftIO $ U.logm "****** reactor: processing NotDidChangeTextDocument"
@@ -503,6 +508,8 @@ reactor inp diagIn = do
 
           queueDiagnosticsRequest diagIn DiagnosticOnChange tn uri ver
 
+        -- -------------------------------
+
         NotDidCloseTextDocument notification -> do
           liftIO $ U.logm "****** reactor: processing NotDidCloseTextDocument"
           let
@@ -517,9 +524,7 @@ reactor inp diagIn = do
 
         ReqRename req -> do
           liftIO $ U.logs $ "reactor:got RenameRequest:" ++ show req
-          let params = req ^. J.params
-              doc = params ^. J.textDocument . J.uri
-              pos = params ^. J.position
+          let (params, doc, pos) = reqParams req
               newName  = params ^. J.newName
               callback = reactorSend . RspRename . Core.makeResponseMessage req
           let hreq = GReq tn (Just doc) Nothing (Just $ req ^. J.id) callback
@@ -589,7 +594,6 @@ reactor inp diagIn = do
                   Nothing -> reactorSend $ RspExecuteCommand $ Core.makeResponseMessage req $ dynToJSON obj
 
               execCmd cmdId args = do
-                vfsFunc <- asksLspFuncs Core.getVirtualFileFunc
                 -- The parameters to the HIE command are always the first element
                 let cmdParams = case args of
                      Just (J.List (x:_)) -> x
@@ -624,7 +628,7 @@ reactor inp diagIn = do
                   -- Just an ordinary HIE command
                   Just (plugin, cmd) ->
                     let preq = GReq tn Nothing Nothing (Just $ req ^. J.id) callback
-                               $ runPluginCommand plugin cmd vfsFunc cmdParams
+                               $ runPluginCommand plugin cmd cmdParams
                     in makeRequest preq
 
                   -- Couldn't parse the command identifier
@@ -641,9 +645,7 @@ reactor inp diagIn = do
 
         ReqCompletion req -> do
           liftIO $ U.logs $ "reactor:got CompletionRequest:" ++ show req
-          let params = req ^. J.params
-              doc = params ^. (J.textDocument . J.uri)
-              pos = params ^. J.position
+          let (_, doc, pos) = reqParams req
 
           mprefix <- getPrefixAtPos doc pos
 
@@ -684,9 +686,7 @@ reactor inp diagIn = do
 
         ReqDocumentHighlights req -> do
           liftIO $ U.logs $ "reactor:got DocumentHighlightsRequest:" ++ show req
-          let params = req ^. J.params
-              doc = params ^. (J.textDocument . J.uri)
-              pos = params ^. J.position
+          let (_, doc, pos) = reqParams req
               callback = reactorSend . RspDocumentHighlights . Core.makeResponseMessage req . J.List
           let hreq = IReq tn (req ^. J.id) callback
                    $ Hie.getReferencesInDoc doc pos
@@ -707,9 +707,7 @@ reactor inp diagIn = do
         ReqFindReferences req -> do
           liftIO $ U.logs $ "reactor:got FindReferences:" ++ show req
           -- TODO: implement project-wide references
-          let params = req ^. J.params
-              doc = params ^. (J.textDocument . J.uri)
-              pos = params ^. J.position
+          let (_, doc, pos) = reqParams req
               callback = reactorSend . RspFindReferences.  Core.makeResponseMessage req . J.List
           let hreq = IReq tn (req ^. J.id) callback
                    $ fmap (map (J.Location doc . (^. J.range)))
@@ -814,8 +812,7 @@ queueDiagnosticsRequest diagIn dt tn uri mVer =
 -- results back to the client
 requestDiagnostics :: DiagnosticsRequest -> R ()
 requestDiagnostics DiagnosticsRequest{trigger, file, trackingNumber, documentVersion} = do
-  when (S.member trigger (S.fromList [DiagnosticOnChange,DiagnosticOnOpen])) $
-    requestDiagnosticsNormal trackingNumber file documentVersion
+  requestDiagnosticsNormal trackingNumber file documentVersion
 
   diagFuncs <- asks diagnosticSources
   lf <- asks lspFuncs
@@ -915,6 +912,16 @@ requestDiagnosticsNormal tn file mVer = do
   makeRequest reqg
 
 -- ---------------------------------------------------------------------
+
+reqParams ::
+     (J.HasParams r p, J.HasTextDocument p i, J.HasUri i u, J.HasPosition p l)
+  => r
+  -> (p, u, l)
+reqParams req = (params, doc, pos)
+  where
+    params = req ^. J.params
+    doc = params ^. (J.textDocument . J.uri)
+    pos = params ^. J.position
 
 syncOptions :: J.TextDocumentSyncOptions
 syncOptions = J.TextDocumentSyncOptions
